@@ -26,7 +26,7 @@ import torch
 import inspect
 import linecache
 from collections import defaultdict
-from unsloth_zoo.rl_replacements import RL_REPLACEMENTS, left_pack_padding
+from unsloth_zoo.rl_replacements import RL_REPLACEMENTS, left_pack_padding, _resolve_grpo_autocast_dtype
 from unsloth_zoo.utils import Version
 from trl import __version__ as trl_version_raw
 from importlib.metadata import version as importlib_version
@@ -240,10 +240,8 @@ def grpo_trainer__prepare_inputs(function_name, function):
     function = function.replace(
         "with torch.inference_mode():",
         "with torch.inference_mode(), "
-        "torch.amp.autocast(device_type = 'cuda', "
-        "dtype = ((torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16) "
-        "if not torch.is_autocast_enabled('cuda') else nullcontext())"
-        "if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '0' else torch.float16):",
+        "(nullcontext() if torch.is_autocast_enabled('cuda') or os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1' "
+        "else torch.amp.autocast(device_type = 'cuda', dtype = _resolve_grpo_autocast_dtype(self.args, self.model))):",
     )
     function = function.replace(
         "self.accelerator.unwrap_model(self.model)",
@@ -621,16 +619,10 @@ def grpo_trainer__get_per_token_logps(function_name, function):
             return None  # Unsloth efficient GRPO
         # Otherwise, calculate normally:
         if not hasattr(self, "_autocast_dtype"):
-            self._autocast_dtype = (
-                torch.float16
-                if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
-                else torch.bfloat16
-            )
-            if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-                self._autocast_dtype = torch.float16
+            self._autocast_dtype = _resolve_grpo_autocast_dtype(self.args, model)
 
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-        with torch.amp.autocast(device_type = DEVICE_TYPE, dtype = self._autocast_dtype):
+        with (nullcontext() if self._autocast_dtype is None else torch.amp.autocast(device_type = DEVICE_TYPE, dtype = self._autocast_dtype)):
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             logits = model(
                 input_ids = input_ids,
@@ -687,13 +679,7 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
             return None, None
         else:
             if not hasattr(self, "_autocast_dtype"):
-                self._autocast_dtype = (
-                    torch.float16
-                    if os.environ.get("ACCELERATE_MIXED_PRECISION", "fp16") == "fp16"
-                    else torch.bfloat16
-                )
-                if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1":
-                    self._autocast_dtype = torch.float16
+                self._autocast_dtype = _resolve_grpo_autocast_dtype(self.args, model)
 
             pixel_values, image_grid_thw = (
                 kwargs.get("pixel_values", None),
@@ -839,8 +825,10 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
                     pixel_attention_mask_chunk,
                     image_sizes_chunk,
                 ) in zipped_inputs:
-                    with torch.amp.autocast(
-                        device_type = "cuda", dtype = self._autocast_dtype
+                    with (
+                        nullcontext()
+                        if self._autocast_dtype is None
+                        else torch.amp.autocast(device_type = "cuda", dtype = self._autocast_dtype)
                     ):
                         if pixel_values is None:
                             logits_chunk = unwrapped_model(
@@ -925,6 +913,7 @@ grpo_compute_loss_slow = RL_REPLACEMENTS["grpo_compute_loss_slow"]
 UnslothEfficientGRPO = RL_REPLACEMENTS["UnslothEfficientGRPO"]
 grpo_accumulated_loss = RL_REPLACEMENTS["grpo_accumulated_loss"]
 grpo_update_SamplingParams = RL_REPLACEMENTS["grpo_update_SamplingParams"]
+RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(_resolve_grpo_autocast_dtype))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(grpo_compute_loss))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(UnslothEfficientGRPO))
 RL_PRE_ITEMS["grpo_trainer"].append(inspect.getsource(grpo_accumulated_loss))
